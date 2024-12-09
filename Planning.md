@@ -1,7 +1,158 @@
 # Main Goal
-- Allow using `by` delegation with instance properties
+1. Allow using `by` delegation with instance properties
+2. Allow using `by` delegation on a method-by-method basis
 
-# Side Goal: `as`
+## Instance Properties
+```kotlin
+interface IFoo {
+	fun foo()
+} // etc
+
+class Example : IFoo by myFoo, IBar by myBar, IBaz by myBaz {
+	val myFoo: IFoo = IFoo.Impl()
+	var myBar = IBar.Impl()
+	lateinit var myBaz: IBaz
+}
+// compiles to:
+class Example : IFoo, IBar, IBaz {
+	val myFoo = IFoo.Impl()
+	var myBar = IBar.Impl()
+	lateinit var myBaz: IBaz
+	
+	override fun foo() = myFoo.foo()
+	override fun bar() = myBar.bar()
+	override fun baz() = myBaz.baz() // throws normally if not initialized before being called, just like manual delegation
+}
+```
+
+The only point is to have it be what it is: shorthand for manual redirection boilerplate, not any kind of guarded language construct. 
+
+This is literally what Kotlin does already, just solely with hidden `val`s named stuff like `$$delegate1`.
+
+This also allows us to finally resolve conflicting methods without having to manually implement redirection for the whole thing ourselves:
+
+```kotlin
+interface Deserializable {
+	fun restoreState(state: StateHolder)
+}
+class ArmMover : ArmMovable, Deserializable {
+	override fun restoreState(state: StateHolder) {
+		this.armPosition = state.getTag("armPosition")
+	}
+}
+class LegMover : LegMovable, Deserializable {
+	override fun restoreState(state: StateHolder) {
+		this.legPosition = state.getTag("legPosition")
+	}
+}
+
+class MainBody : Deserializable, ArmMovable by ArmMover(), LegMovable by LegMover() {
+	override fun restoreState(state: StateHolder) {
+		this.heartBpm = state.getTag("heartBpm")
+		// can't reference either anonymous property despite the fact that they exist
+	}
+}
+
+// modified syntax, still essentially compiles to the same thing but exposed
+
+class MainBody : Deserializable, ArmMovable by armMover, LegMovable by legMover {
+	val armMover = ArmMover()
+	val legMover = LegMover()
+	
+	override fun restoreState(state: StateHolder) {
+		this.heartBpm = state.getTag("heartBpm")
+		armMover.restoreState(state)
+		legMover.restoreState(state)
+	}
+}
+```
+
+AND YES I KNOW YOU CAN DO THIS: 
+```kotlin
+class MainBody(val armMover: ArmMover, val legMover: legMover) : Deserializable, ArmMovable by armMover, LegMovable by legMover {
+	override fun restoreState(state: StateHolder) {
+		this.heartBpm = state.getTag("heartBpm")
+		armMover.restoreState(state)
+		legMover.restoreState(state)
+	}
+}
+```
+but sometimes you're forced to have a billion constructor parameters already and there's never any instance where you'd want to pass a different component in, so adding constructor parameters for _every single interface_ is stupid
+
+## 2. `by` with Instance Methods
+
+Solving the diamond problem:
+
+```kotlin
+interface Foo1 : Foo {
+	override fun foo() {
+		println("one")
+	}
+}
+interface Foo2 : Foo1 {
+	override fun foo() {
+		println("two")
+	}
+}
+interface Bar : Foo1 {
+	fun bar()
+	
+	/* inherited from Foo1:
+	override fun foo() = println("one")
+	 */
+}
+interface Qux : Foo2 {
+	fun qux()
+	
+	/* inherited from Foo2: 
+	override fun foo() = println("two")
+	 */
+}
+
+class MyThing : Bar by Bar.Impl(), Qux by Qux.Impl() {
+	// Ok so which `foo` do we use? Cause both distinct interface trees declare Foo#foo, but they default it differently.
+}
+
+// to resolve this vanilla, we have to manually redirect for the ENTIRE TREE just to resolve ONE single method conflict:
+class MyThing : Bar, Qux {
+	val myBar = Bar.Impl()
+	val myQux = Qux.Impl()
+	
+	override fun foo() = myBar.foo() // specifically use Bar's version of Foo#foo
+	
+	override fun bar() = myBar.bar()
+	override fun qux() = myQux.qux()
+}
+
+// With the altered syntax, though:
+class MyThing : Bar by myBar, Qux by myQux {
+	val myBar = Bar.Impl()
+	val myQux = Qux.Impl()
+	
+	// exactly the same thing, but with only two words instead of explicitly (since we already know what we're overriding), 
+	// and only having to resolve the conflicting method(s) instead of the entire redirection tree
+	override fun foo() by myBar
+}
+```
+
+hmm, actually! we don't even need to make them instance variables!
+```kotlin
+class MyThing : Bar by Bar.Impl(), Qux by Qux.Impl() {
+	// Specify that we're using Bar#foo, AKA Foo1#foo
+	override fun foo() by Bar 
+	// compiles to:
+	override fun foo() = `$$delegate$2$bar$$`.foo() // or whatever kotlin's hidden property name is
+	
+	// Alt: could we even do this, since that's up there in the tree? 
+	override fun foo() by Foo1
+	// It would need to find the first redirected property that has that in its tree. 
+	// Not sure if this is too brittle... make this a stretch goal
+	// also this would need a warning for conflicting methods and an "unused" warning if redundant
+	
+}
+```
+
+# Side Goal: `as`, and TRUE delegation
 What is the point of this? 
 
 Well, current delegation is actually fully inherited, with the source object taking on all of the delegated interface's members.
@@ -11,7 +162,7 @@ interface Part1 {
 	fun partMethod()
 }
 
-class Foo : Part1 by Part1.Impl()
+class Foo : Part1 by Part1.Impl() {}
 
 // what's actually happening:
 class Foo : Part1 {
@@ -32,7 +183,7 @@ interface Part2 {
 class Bar : Part1 by Part1.Impl(), Part2 by Part2.Impl() // CAN'T DO THIS BECAUSE OF NAMING CONFLICT
 ```
 
-One way to resolve this is to use the more-_verbose_ (and arguably the _real_ version of the) delegation pattern:
+One way to resolve this is to use the more-_verbose_ (and arguably _real_ version of the) delegation pattern:
 
 ```kotlin
 interface IHavePart1 {
@@ -74,13 +225,13 @@ When we do this, what is this new object? It doesn't have any state of its own, 
 It's just a _delegate_, for that behavior.  You tell it to do something, and it passes that on to the original source.
 
 But more generally, and on a higher level, it is a _**VIEW** OF THE ORIGINAL SOURCE OBJECT_
-Just like upcasting to Rotatable, you are stripping down the unique properties of the object and **viewing it** as a Rotatable.  It's just like getting a Set from a Map: despite how stupid that pattern is, it's an example of this same behavior - exposing the exact same source object in a different way!
+Just like upcasting to Rotatable, you are stripping down the unique properties of the object and **viewing it** as a Rotatable.  It's just like getting a Set from a Map: despite how stupid that pattern is, it's an example of this same behavior - exposing the exact same source object in a _different way_!
 
 This touches on something in higher-level programming known as "Optics": rather than outright transforming one object into a different type just to have a new set of methods to interact with it, we _view it in a different way_.  Just like `Set.add(x)` being turned into `Map.put(x, true)` on the backend, interacting with the perfectly normal set in front of you interacts with the original map!
 
-My mental image has been like, this fuzzy thing of having a guy and a tiny man coming out of his chest that's still connected to the larger guy, and messing with the little man does something to the bigger dude.  My mental image is also very influenced by that one doctor who episode with the shapeshifting robot man piloted by tiny people - it's a whole thing and really abstract, don't read into it - but you get the general idea.
+My mental image has always been like, this fuzzy thing of having a guy and a tiny man coming out of his chest that's still connected to the larger guy, and messing with the little man does something to the bigger dude.  My mental image is also very influenced by that one doctor who episode with the shapeshifting robot man piloted by tiny people - it's a whole thing and really abstract, don't read into it - but you get the general idea.
 
-Or like a _remote control_ for a larger machine: you could spin the dials and everything on the main control panel, _or_ you could take the remote and bring it with you. You're taking a "remote" object with you, but the remote doesn't actually have anything in itself to worry about, it's just a _modifiable view_ of the original machine's state!
+Or like a _remote control_ for a larger machine: you could spin the dials and everything on the main control panel, _or_ you could take the remote and bring it with you. You're taking a "remote" object with you, but the remote doesn't actually have anything in itself to worry about, it's just a _view_ of the original machine's state! And can be modified as such to change the original machine, without having any state of its own related to the machine
 
 With that idea in mind, we don't actually need inner classes to stay "inner", do we!  All we want is something that can be interacted with in a certain way - for instance, being "rotatable" - and for anything done to that "thing" to modify the original object's state.
 
@@ -122,7 +273,7 @@ class Machine {
 	}
 }
 ```
-Obviously since we want to save on object creation, we'd probably just hold onto the views instead of constantly disposing of them, but honestly that might take up more memory than just recreating them each time so what do I know?
+Obviously since we want to save on object creation, we'd probably just hold onto the views instead of constantly disposing of them, but honestly that might take up more memory than just recreating them each time so what do I know? It totally depends on the circumstance
 
 With this in mind, there's still one major problem with this pattern:
 
@@ -130,7 +281,7 @@ With this in mind, there's still one major problem with this pattern:
 
 Obviously, interfaces aren't _just_ views on their own. They also tell other people _that_ they're viewable that way.
 
-One way would be another interface - called a "bridge" - to tell others that they can be viewed as a wrenchable using a given method:
+One way would be another interface - called a "bridge" - to tell others that they _can_ be viewed as a wrenchable using a given method:
 
 ```kotlin
 interface ViewableAsWrenchable {
@@ -160,74 +311,89 @@ Now, of course, doing this dynamically doesn't really make sense when you could 
 ## What does this do?
 
 ```kotlin
-@View
-interface Wrenchable {
+interface btpos.tools.Wrenchable {
 	fun onWrench()
 }
 
-// generates:
+class Foo : Wrenchable through WrenchableView() 
 
-interface Wrenchable {
-	fun onWrench()
-	
-	interface WrenchableProvider {
-		fun asWrenchable(): Wrenchable
-	}
-}
-
-class Foo : Wrenchable through wrn {
+class Bar : Wrenchable through wrn {
 	val wrn = WrenchableView()
 }
 
-// allows the use of:
-Foo().to<Wrenchable>().onWrench() // brackets not required
+// GENERATES:
+interface bridges.btpos.tools.WrenchableProvider { // shared package to not make duplicates
+	fun asWrenchable(): Wrenchable
+}
 
-// generates:
+// COMPILES TO:
 class Foo : WrenchableProvider {
+	private val `$$delegate$0$Wrenchable`: Wrenchable = WrenchableView() // this is how Kotlin natively handles "by" declarations
+	
+	override fun asWrenchable(): Wrenchable {
+		return `$$delegate$0$Wrenchable`
+	}
+}
+
+class Bar : WrenchableProvider {
 	val wrn = WrenchableView()
 	
 	override fun asWrenchable(): Wrenchable {
 		return wrn
 	}
 }
+```
 
+## What does this allow?
 
-val foo = Foo()
-foo.to<Wrenchable>().useWrench()
-(foo as Wrenchable).useWrench()
-//foo.useWrench()
-// directly compiles to:
+```kotlin
+Foo().to<Wrenchable>().onWrench() // brackets not required if unambiguous
+Foo().onWrench() // if `onWrench()` isn't ambiguous, otherwise the cast must be explicitly done
+(Foo() as Wrenchable).onWrench()
+
+// both directly compile to:
 foo.asWrenchable().useWrench()
 ```
 
-ok problem tho:
 ```kotlin
-foo is Wrenchable
+fun acceptsWrenchable(x: Wrenchable) { 
+	// ...
+}
+
+acceptsWrenchable(Foo())
 // compiles to:
-(foo is Wrenchable || foo is ViewProvider && foo.`as`<Wrenchable>() != null)
+acceptsWrenchable(Foo().asWrenchable())
 ```
 
-...hmmmmmmmm, no
-best way to do this is to just define a bridge interface INSIDE the other interface, so there's not only a standardized way of using the interface but also of accessing it as that interface
-
-
-
-
-
-
-
-The current Kotlin delegation pattern is basically just modularity with a bit less boilerplate.
-
-Change it from this dynamic approach:
 ```kotlin
-inline fun <reified T> `as`() : T {
-	return when (T) {
-		Part1 -> ourPart1
-		Part2 -> ourPart2
-		else -> throw ClassCastException("${this::class} cannot be cast to $T")
-	}
+Foo() is btpos.tools.Wrenchable
+// compiles to:
+val foo = Foo()
+(foo is btpos.tools.Wrenchable || foo is bridges.btpos.tools.WrenchableProvider)
+```
+
+Since the only way to have other APIs get a Wrenchable instance is through method calls...... i think (spring might make things difficult), this _shouldn't_ be a problem as long as we do the conversions right?
+
+We're essentially enabling polymorphism with _component views_ instead of views of the _original object_.
+
+Problem: what if we want to allow people to declare that their subclasses will have wrenchable values? How do they reference that generated interface?
+```kotlin
+interface IComposite : btpos.tools.Wrenchable from wrenchable, btpos.tools.Rotatable from rotatable {
+	val wrenchable: Wrenchable
+	val rotatable: Rotatable
+}
+// compiles to:
+interface IComposite : bridges.btpos.tools.Wrenchable, bridges.btpos.tools.Rotatable {
+	val wrenchable: Wrenchable
+	val rotatable: Rotatable
+	
+	override fun asWrenchable(): Wrenchable = wrenchable
+	override fun asRotatable(): Rotatable = rotatable
 }
 ```
-To a true _part_-based delegation with inner classes (or classes with `this` references) and optics
-Be able to view it AS an interface - through a DELEGATE - _instead of directly CASTING_ the original object
-Be able to define transformations on an object and directly convert between them implicitly using the standard syntax.
+Yeah, this works.
+
+
+
+Question: Should the keyword be `through` or `from`? 
+I think it's better to be `through` since calls are going THROUGH the delegate FIRST and THEN to the source object
